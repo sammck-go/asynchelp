@@ -1,4 +1,4 @@
-module github.com/sammck-go/asynchelp
+module github.com/sammck-go/asyncobj
 
 go 1.16
 
