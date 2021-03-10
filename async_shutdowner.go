@@ -1,4 +1,4 @@
-package asynchelp
+package asyncobj
 
 // AsyncShutdowner is an interface implemented by objects that provide
 // asynchronous shutdown capability. Shutdown() is similar to Close() except
@@ -23,11 +23,12 @@ package asynchelp
 // from WaitShutdown(). The implementation may use this value or decide to return
 // something else.
 //
-// ShutdownDoneChan returns a chan that is closed after shutdown is complete.
+// ShutdownDoneChan returns a chan that is closed after shutdown is complete, including
+// shutdown of dependents.
 // After this channel is closed, it is guaranteed that IsDoneShutdown() will
 // return true, and WaitForShutdown will not block.
 //
-// IsDoneShutdown returns false if the object is not yet completely
+// IsDoneShutdown returns false if the object and all dependents have not yet completely
 // shut down. Otherwise it returns true with the guarantee that
 // ShutDownDoneChan() will be immediately closed and WaitForShutdown
 // will immediately return the final status.
