@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"sync"
+
+	llogger "github.com/sammck-go/logger"
 )
 
 // HandleOnceActivator is an interface that may be implemented by the object managed by AsyncObjHelper if
@@ -156,13 +158,23 @@ type Helper struct {
 	wg sync.WaitGroup
 }
 
-// InitHelperWithShutdownHandler initializes a new Helper in place with an independent
-// shutdown handler function. Useful for embedding in an object.
+// InitHelperWithShutdownHandler initializes a new Helper in place with an optional independent
+// shutdown handler function. Useful for embedding in an object, when it must be initialized after
+// the obj pointer is available.
+// if logger is nil, a NilLogger is attached.
+// If shutDownHandler is nil, then obj must implement HandleOnceShutdowner
 func (h *Helper) InitHelperWithShutdownHandler(
 	obj interface{},
 	logger Logger,
 	shutdownHandler OnceShutdownHandler,
 ) {
+	if shutdownHandler == nil {
+		// panic early if required interface not implemented
+		_ = obj.(HandleOnceShutdowner)
+	}
+	if logger == nil {
+		logger = llogger.NilLogger
+	}
 	h.Logger = logger
 	h.obj = obj
 	h.state = StateUnactivated
@@ -173,21 +185,30 @@ func (h *Helper) InitHelperWithShutdownHandler(
 	h.shutdownDoneChan = make(chan struct{})
 }
 
-// InitHelper initializes a new Helper in place. Useful for embedding in an object.
+// InitHelper initializes a new Helper in place for an object that implements HandleOnceShutdowner. Useful for embedding in an object.
 func (h *Helper) InitHelper(
 	logger Logger,
 	obj HandleOnceShutdowner,
 ) {
-	h.InitHelperWithShutdownHandler(obj, logger, WrapHandleOnceShutdowner(obj))
+	h.InitHelperWithShutdownHandler(obj, logger, nil)
 }
 
 // NewHelperWithShutdownHandler creates a new Helper as its own object with an independent
 // shutdown handler function.
+// if logger is nil, a NilLogger is attached.
+// If shutDownHandler is nil, then obj must implement HandleOnceShutdowner
 func NewHelperWithShutdownHandler(
 	obj interface{},
 	logger Logger,
 	shutdownHandler OnceShutdownHandler,
 ) *Helper {
+	if shutdownHandler == nil {
+		// panic early if required interface not implemented
+		_ = obj.(HandleOnceShutdowner)
+	}
+	if logger == nil {
+		logger = llogger.NilLogger
+	}
 	h := &Helper{
 		Logger:                logger,
 		obj:                   obj,
@@ -206,7 +227,7 @@ func NewHelper(
 	logger Logger,
 	obj HandleOnceShutdowner,
 ) *Helper {
-	h := NewHelperWithShutdownHandler(obj, logger, WrapHandleOnceShutdowner(obj))
+	h := NewHelperWithShutdownHandler(obj, logger, nil)
 	return h
 }
 
@@ -632,7 +653,12 @@ func (h *Helper) Shutdown(completionError error) error {
 // state transitions up to StateShutdown.
 func (h *Helper) asyncDoStartedShutdown() {
 	go func() {
-		shutdownErr := h.shutdownHandler(h.shutdownErr)
+		var shutdownErr error
+		if h.shutdownHandler == nil {
+			shutdownErr = h.obj.(HandleOnceShutdowner).HandleOnceShutdown(h.shutdownErr)
+		} else {
+			shutdownErr = h.shutdownHandler(h.shutdownErr)
+		}
 		h.DLogf("->shutdownHandlerDone")
 		h.Lock.Lock()
 		h.shutdownErr = shutdownErr
