@@ -7,6 +7,18 @@ import (
 	"sync"
 )
 
+// HandleOnceActivator is an interface that may be implemented by the object managed by AsyncObjHelper if
+// the object provides its own HandleOnceActivate method. If the object does not provide this method, a handler
+// function can be provided directly to DoOnceActivate.
+type HandleOnceActivator interface {
+	// HandleOnceActivate is called exactly once from DoOnceActivate, in StateActivating, with shutdown deferred,
+	// to activate the object that supports shutdown.
+	// If it returns nil, the object will be activated. If it returns an error, the object will not be activated,
+	// and shutdown will be immediately started.
+	// If shutdown has already started before DoOnceActivate is called, this function will not be invoked.
+	HandleOnceActivate() error
+}
+
 // OnceActivateCallback is a function that is called exactly once, in StateActivating, with shutdown deferred,
 // to activate the object that supports shutdown.
 // If it returns nil, the object will be activated. If it returns an error, the object will not be activated,
@@ -23,7 +35,7 @@ type OnceShutdownHandler func(completionError error) error
 // the object provides its own HandleOnceShutdown method. If the object does not provide this method, a handler
 // function can be provided directly to InitHelperWithShutdownHandler.
 type HandleOnceShutdowner interface {
-	// Shutdown will be called exactly once, in StateShuttingDown, in its own goroutine. It should take completionError
+	// HandleOnceShutdown will be called exactly once, in StateShuttingDown, in its own goroutine. It should take completionError
 	// as an advisory completion value, actually shut down, then return the real completion value.
 	// This method will never be called while shutdown is deferred.
 	HandleOnceShutdown(completionError error) error
@@ -78,6 +90,9 @@ const (
 type Helper struct {
 	// Logger is the Logger that will be used for log output from this helper
 	Logger
+
+	// o is the object being managed
+	obj interface{}
 
 	// Lock is a general-purpose fine-grained mutex for this helper; it may be used
 	// as a general-purpose lock by derived objects as well
@@ -144,10 +159,12 @@ type Helper struct {
 // InitHelperWithShutdownHandler initializes a new Helper in place with an independent
 // shutdown handler function. Useful for embedding in an object.
 func (h *Helper) InitHelperWithShutdownHandler(
+	obj interface{},
 	logger Logger,
 	shutdownHandler OnceShutdownHandler,
 ) {
 	h.Logger = logger
+	h.obj = obj
 	h.state = StateUnactivated
 	h.shutdownHandler = shutdownHandler
 	h.activatingDoneChan = make(chan struct{})
@@ -159,19 +176,21 @@ func (h *Helper) InitHelperWithShutdownHandler(
 // InitHelper initializes a new Helper in place. Useful for embedding in an object.
 func (h *Helper) InitHelper(
 	logger Logger,
-	o HandleOnceShutdowner,
+	obj HandleOnceShutdowner,
 ) {
-	h.InitHelperWithShutdownHandler(logger, WrapHandleOnceShutdowner(o))
+	h.InitHelperWithShutdownHandler(obj, logger, WrapHandleOnceShutdowner(obj))
 }
 
 // NewHelperWithShutdownHandler creates a new Helper as its own object with an independent
 // shutdown handler function.
 func NewHelperWithShutdownHandler(
+	obj interface{},
 	logger Logger,
 	shutdownHandler OnceShutdownHandler,
 ) *Helper {
 	h := &Helper{
 		Logger:                logger,
+		obj:                   obj,
 		state:                 StateUnactivated,
 		shutdownHandler:       shutdownHandler,
 		activatingDoneChan:    make(chan struct{}),
@@ -185,9 +204,9 @@ func NewHelperWithShutdownHandler(
 // NewHelper creates a new Helper as an independent object
 func NewHelper(
 	logger Logger,
-	o HandleOnceShutdowner,
+	obj HandleOnceShutdowner,
 ) *Helper {
-	h := NewHelperWithShutdownHandler(logger, WrapHandleOnceShutdowner(o))
+	h := NewHelperWithShutdownHandler(obj, logger, WrapHandleOnceShutdowner(obj))
 	return h
 }
 
@@ -279,16 +298,23 @@ func (h *Helper) SetIsActivated() error {
 // first caller will perform activation, but all callers will complete when the first caller
 // completes, and will complete with the same return code.
 //
-// Note that while onceAcivateCallback is running, shutdown is deferred.  This prevents the
+// Note that while onceActivateCallback is running, shutdown is deferred.  This prevents the
 // object from being actively shut down while activation is in progress (though a shutdown
 // can be scheduled). Because of this, onceActivateCallback *must not* wait for shutdown
 // or call Close(), since a deadlock will result.
+//
+// if onceActivateCallback is nil, interface HandleOnceActivator on the object must be implemented and is used instead.
 //
 // The caller must not call this method with waitOnFail==true if shutdowns are deferred, unless
 // these deferrals can be released before DoOnceActivate returns; otherwise a deadlock will occur.
 func (h *Helper) DoOnceActivate(onceActivateCallback OnceActivateCallback, waitOnFail bool) error {
 	var err error
 	h.Lock.Lock()
+	if h.isActivated {
+		// Early out for already successfully activated
+		h.Lock.Unlock()
+		return nil
+	}
 	if h.state == StateActivating {
 		// activating already started by someone else... Wait for it to finish before figuring
 		// out what to do next
@@ -321,7 +347,12 @@ func (h *Helper) DoOnceActivate(onceActivateCallback OnceActivateCallback, waitO
 	h.state = StateActivating
 	h.Lock.Unlock()
 
-	err = onceActivateCallback()
+	if onceActivateCallback == nil {
+		err = onceActivateCallback()
+	} else {
+		err = h.obj.(HandleOnceActivator).HandleOnceActivate()
+	}
+
 	if err == nil {
 		err = h.SetIsActivated()
 	}
@@ -492,24 +523,32 @@ func (h *Helper) ShutdownOnContext(ctx context.Context) {
 // IsScheduledShutdown returns true if StartShutdown() has been called. It continues to return true after shutdown
 // is started and completes
 func (h *Helper) IsScheduledShutdown() bool {
+	h.Lock.Lock()
+	defer h.Lock.Unlock()
 	return h.isScheduledShutdown
 }
 
 // IsStartedShutdown returns true if shutdown has begun. It continues to return true after shutdown
 // is complete
 func (h *Helper) IsStartedShutdown() bool {
+	h.Lock.Lock()
+	defer h.Lock.Unlock()
 	return h.state >= StateShuttingDown
 }
 
 // IsDoneLocalShutdown returns true if local shutdown is complete, not including shutdown of dependents. If
 // true, final completion status is available. Continues to return true after final shutdown.
 func (h *Helper) IsDoneLocalShutdown() bool {
+	h.Lock.Lock()
+	defer h.Lock.Unlock()
 	return h.state >= StateLocalShutdown
 }
 
 // IsDoneShutdown returns true if shutdown is complete, including shutdown of dependents. Final completion
 // status is available.
 func (h *Helper) IsDoneShutdown() bool {
+	h.Lock.Lock()
+	defer h.Lock.Unlock()
 	return h.state >= StateShutDown
 }
 
@@ -593,9 +632,10 @@ func (h *Helper) Shutdown(completionError error) error {
 // state transitions up to StateShutdown.
 func (h *Helper) asyncDoStartedShutdown() {
 	go func() {
-		h.shutdownErr = h.shutdownHandler(h.shutdownErr)
+		shutdownErr := h.shutdownHandler(h.shutdownErr)
 		h.DLogf("->shutdownHandlerDone")
 		h.Lock.Lock()
+		h.shutdownErr = shutdownErr
 		h.state = StateLocalShutdown
 		close(h.localShutdownDoneChan)
 		h.Lock.Unlock()
