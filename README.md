@@ -41,9 +41,8 @@ that must be cleanly released.
 
 ```go
 type AsyncShutdowner interface {
-	StartShutdown(completionErr error)
+	StartShutdown(completionErr error) bool
 	ShutdownDoneChan() <-chan struct{}
-	IsDoneShutdown() bool
 	WaitShutdown() error
 }
 ```
@@ -66,27 +65,54 @@ See shutdown_helper.go for tools that make it easy to implement this interface.
 Methods:
 
 StartShutdown schedules asynchronous shutdown of the object. If the object has
-already been scheduled for shutdown, it has no effect. completionErr is an
-advisory error (or nil) to use as the completion status from WaitShutdown(). The
-implementation may use this value or decide to return something else.
+already been scheduled for shutdown, it has no effect. It returns true if
+shutdown was actually started by this call, or false if shutdown had already
+been started. completionErr is an advisory error (or nil) to use as the
+completion status from WaitShutdown(). The implementation may use this value or
+decide to return something else.
 
 ShutdownDoneChan returns a chan that is closed after shutdown is complete,
 including shutdown of dependents. After this channel is closed, it is guaranteed
 that IsDoneShutdown() will return true, and WaitForShutdown will not block.
 
-IsDoneShutdown returns false if the object and all dependents have not yet
-completely shut down. Otherwise it returns true with the guarantee that
-ShutDownDoneChan() will be immediately closed and WaitForShutdown will
-immediately return the final status.
-
 WaitShutdown blocks until the object is completely shut down, and returns the
 final completion status
+
+#### type HandleOnceActivateShutdowner
+
+```go
+type HandleOnceActivateShutdowner interface {
+	HandleOnceActivator
+	HandleOnceShutdowner
+}
+```
+
+HandleOnceActivateShutdowner includes all of the methods from both
+HandleOnceActivator and HandleOnceShutdowner
+
+#### type HandleOnceActivator
+
+```go
+type HandleOnceActivator interface {
+	// HandleOnceActivate is called exactly once from DoOnceActivate, in StateActivating, with shutdown deferred,
+	// to activate the object that supports shutdown.
+	// If it returns nil, the object will be activated. If it returns an error, the object will not be activated,
+	// and shutdown will be immediately started.
+	// If shutdown has already started before DoOnceActivate is called, this function will not be invoked.
+	HandleOnceActivate() error
+}
+```
+
+HandleOnceActivator is an interface that may be implemented by the object
+managed by AsyncObjHelper if the object provides its own HandleOnceActivate
+method. If the object does not provide this method, a handler function can be
+provided directly to DoOnceActivate.
 
 #### type HandleOnceShutdowner
 
 ```go
 type HandleOnceShutdowner interface {
-	// Shutdown will be called exactly once, in StateShuttingDown, in its own goroutine. It should take completionError
+	// HandleOnceShutdown will be called exactly once, in StateShuttingDown, in its own goroutine. It should take completionError
 	// as an advisory completion value, actually shut down, then return the real completion value.
 	// This method will never be called while shutdown is deferred.
 	HandleOnceShutdown(completionError error) error
@@ -120,7 +146,7 @@ being managed, but it can also work as an independent managing object.
 ```go
 func NewHelper(
 	logger Logger,
-	o HandleOnceShutdowner,
+	obj HandleOnceShutdowner,
 ) *Helper
 ```
 NewHelper creates a new Helper as an independent object
@@ -129,12 +155,15 @@ NewHelper creates a new Helper as an independent object
 
 ```go
 func NewHelperWithShutdownHandler(
+	obj interface{},
 	logger Logger,
 	shutdownHandler OnceShutdownHandler,
 ) *Helper
 ```
 NewHelperWithShutdownHandler creates a new Helper as its own object with an
-independent shutdown handler function.
+independent shutdown handler function. if logger is nil, a NilLogger is
+attached. If shutDownHandler is nil, then obj must implement
+HandleOnceShutdowner
 
 #### func (*Helper) AddAsyncShutdownChild
 
@@ -237,11 +266,14 @@ parameters). Only the first caller will perform activation, but all callers will
 complete when the first caller completes, and will complete with the same return
 code.
 
-Note that while onceAcivateCallback is running, shutdown is deferred. This
+Note that while onceActivateCallback is running, shutdown is deferred. This
 prevents the object from being actively shut down while activation is in
 progress (though a shutdown can be scheduled). Because of this,
 onceActivateCallback *must not* wait for shutdown or call Close(), since a
 deadlock will result.
+
+if onceActivateCallback is nil, interface HandleOnceActivator on the object must
+be implemented and is used instead.
 
 The caller must not call this method with waitOnFail==true if shutdowns are
 deferred, unless these deferrals can be released before DoOnceActivate returns;
@@ -274,21 +306,26 @@ StateShutdown exclusion.
 ```go
 func (h *Helper) InitHelper(
 	logger Logger,
-	o HandleOnceShutdowner,
+	obj HandleOnceShutdowner,
 )
 ```
-InitHelper initializes a new Helper in place. Useful for embedding in an object.
+InitHelper initializes a new Helper in place for an object that implements
+HandleOnceShutdowner. Useful for embedding in an object.
 
 #### func (*Helper) InitHelperWithShutdownHandler
 
 ```go
 func (h *Helper) InitHelperWithShutdownHandler(
+	obj interface{},
 	logger Logger,
 	shutdownHandler OnceShutdownHandler,
 )
 ```
-InitHelperWithShutdownHandler initializes a new Helper in place with an
-independent shutdown handler function. Useful for embedding in an object.
+InitHelperWithShutdownHandler initializes a new Helper in place with an optional
+independent shutdown handler function. Useful for embedding in an object, when
+it must be initialized after the obj pointer is available. if logger is nil, a
+NilLogger is attached. If shutDownHandler is nil, then obj must implement
+HandleOnceShutdowner
 
 #### func (*Helper) IsActivated
 
@@ -416,14 +453,14 @@ shutting down.
 #### func (*Helper) StartShutdown
 
 ```go
-func (h *Helper) StartShutdown(completionErr error)
+func (h *Helper) StartShutdown(completionErr error) bool
 ```
 StartShutdown shedules asynchronous shutdown of the object. If the object has
-already been scheduled for shutdown, it has no effect. If shutting down has been
-deferred, actual starting of the shutdown process is deferred. "completionError"
-is an advisory error (or nil) to use as the completion status from
-WaitShutdown(). The implementation may use this value or decide to return
-something else.
+already been scheduled for shutdown, it has no effect. Returns true / if this is
+the call that initially scheduled shutdown. If shutting down has been deferred,
+actual starting of the shutdown process is deferred. "completionError" is an
+advisory error (or nil) to use as the completion status from WaitShutdown(). The
+implementation may use this value or decide to return something else.
 
 Asynchronously, this will help kick off the following, only the first time it is
 called:
@@ -500,10 +537,11 @@ DeferShutdown.
 #### func (*Helper) UndeferAndStartShutdown
 
 ```go
-func (h *Helper) UndeferAndStartShutdown(completionErr error)
+func (h *Helper) UndeferAndStartShutdown(completionErr error) bool
 ```
 UndeferAndStartShutdown decrements the shutdown defer count and then immediately
-starts shutting down. This method is suitable for use in a defer statement after
+starts shutting down. Returns true iff this call was the first initiator of
+shutdown This method is suitable for use in a defer statement after
 DeferShutdown
 
 #### func (*Helper) UndeferAndWaitLocalShutdown
@@ -596,14 +634,6 @@ StateShuttingDown, in its own goroutine. It should take completionError as an
 advisory completion value, actually shut down, then return the real completion
 value. This function will never be called while shutdown is deferred (and hence,
 will never be called during activation).
-
-#### func  WrapHandleOnceShutdowner
-
-```go
-func WrapHandleOnceShutdowner(o HandleOnceShutdowner) OnceShutdownHandler
-```
-WrapHandleOnceShutdowner generates a OnceShutdownHandler function for an object
-that implements HandleOnceShutdowner
 
 #### type State
 

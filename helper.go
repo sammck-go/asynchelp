@@ -43,12 +43,10 @@ type HandleOnceShutdowner interface {
 	HandleOnceShutdown(completionError error) error
 }
 
-// WrapHandleOnceShutdowner generates a OnceShutdownHandler function for an object that
-// implements HandleOnceShutdowner
-func WrapHandleOnceShutdowner(o HandleOnceShutdowner) OnceShutdownHandler {
-	return func(completionError error) error {
-		return o.HandleOnceShutdown(completionError)
-	}
+// HandleOnceActivateShutdowner includes all of the methods from both HandleOnceActivator and HandleOnceShutdowner
+type HandleOnceActivateShutdowner interface {
+	HandleOnceActivator
+	HandleOnceShutdowner
 }
 
 // State represents a discreet state in the Helper state machine. During transitions, the state can only move
@@ -130,7 +128,7 @@ type Helper struct {
 	// shutdownErr contains the final completion status after state >= StateLocalShutdown
 	shutdownErr error
 
-	// activatingDoneChan is a chan that is closed when the state advances beyond StateActivating. Anyone
+	// activatingDoneChan is a chan that is d when the state advances beyond StateActivating. Anyone
 	// who wants to can wait on this chan to be notified of the end of the activating phase. This
 	// signal does not mean that activation succeeded.
 	activatingDoneChan chan struct{}
@@ -368,7 +366,7 @@ func (h *Helper) DoOnceActivate(onceActivateCallback OnceActivateCallback, waitO
 	h.state = StateActivating
 	h.Lock.Unlock()
 
-	if onceActivateCallback == nil {
+	if onceActivateCallback != nil {
 		err = onceActivateCallback()
 	} else {
 		err = h.obj.(HandleOnceActivator).HandleOnceActivate()
@@ -402,7 +400,7 @@ func (h *Helper) lockedEnterShuttingDownState() {
 	if oldState < StateActivated {
 		close(h.activatingDoneChan)
 	}
-	h.DLogf("->shutdownStartedChan")
+	// h.DLogf("->shutdownStartedChan")
 	close(h.shutdownStartedChan)
 }
 
@@ -426,11 +424,13 @@ func (h *Helper) UndeferShutdown() {
 }
 
 // UndeferAndStartShutdown decrements the shutdown defer count and then
-// immediately starts shutting down.
+// immediately starts shutting down. Returns true iff this call was the
+// first initiator of shutdown
 // This method is suitable for use in a defer statement after DeferShutdown
-func (h *Helper) UndeferAndStartShutdown(completionErr error) {
-	h.StartShutdown(completionErr)
+func (h *Helper) UndeferAndStartShutdown(completionErr error) bool {
+	result := h.StartShutdown(completionErr)
 	h.UndeferShutdown()
+	return result
 }
 
 // UndeferAndLocalShutdown decrements the shutdown defer count and immediately shuts down.
@@ -659,7 +659,7 @@ func (h *Helper) asyncDoStartedShutdown() {
 		} else {
 			shutdownErr = h.shutdownHandler(h.shutdownErr)
 		}
-		h.DLogf("->shutdownHandlerDone")
+		// h.DLogf("->shutdownHandlerDone")
 		h.Lock.Lock()
 		h.shutdownErr = shutdownErr
 		h.state = StateLocalShutdown
@@ -668,14 +668,15 @@ func (h *Helper) asyncDoStartedShutdown() {
 		h.wg.Wait()
 		h.Lock.Lock()
 		h.state = StateShutDown
-		h.DLogf("->shutdownDone")
+		// h.DLogf("->shutdownDone")
 		close(h.shutdownDoneChan)
 		h.Lock.Unlock()
 	}()
 }
 
 // StartShutdown shedules asynchronous shutdown of the object. If the object
-// has already been scheduled for shutdown, it has no effect. If shutting down has
+// has already been scheduled for shutdown, it has no effect. Returns true
+/// if this is the call that initially scheduled shutdown. If shutting down has
 // been deferred, actual starting of the shutdown process is deferred.
 // "completionError" is an advisory error (or nil) to use as the completion status
 // from WaitShutdown(). The implementation may use this value or decide to return
@@ -698,10 +699,11 @@ func (h *Helper) asyncDoStartedShutdown() {
 //  -   Wait for the wait group count to reach 0
 //  -   Signals shutdown complete, using the return value from HandleOnceShutdown
 //  -    as the final completion code
-func (h *Helper) StartShutdown(completionErr error) {
+func (h *Helper) StartShutdown(completionErr error) bool {
 	doShutdownNow := false
 	h.Lock.Lock()
-	if !h.isScheduledShutdown {
+	isFirst := !h.isScheduledShutdown
+	if isFirst {
 		if h.state >= StateShuttingDown {
 			h.Panic("shutdown started before scheduled")
 		}
@@ -717,6 +719,8 @@ func (h *Helper) StartShutdown(completionErr error) {
 	if doShutdownNow {
 		h.asyncDoStartedShutdown()
 	}
+
+	return isFirst
 }
 
 // Close is a default implementation of Close(), which simply shuts down
@@ -726,7 +730,7 @@ func (h *Helper) StartShutdown(completionErr error) {
 // The caller must not call this method if shutdowns are deferred, unless
 // these deferrals can be released before this method returns; otherwise a deadlock will occur.
 func (h *Helper) Close() error {
-	h.DLogf("Close()")
+	// h.DLogf("Close()")
 	return h.Shutdown(nil)
 }
 
@@ -736,7 +740,7 @@ func (h *Helper) Close() error {
 // any action to cause the chan to be closed; it is the caller's responsibility to do that.
 // An error is returned if StateShutdown has already been reached.
 func (h *Helper) AddShutdownChildChan(childDoneChan <-chan struct{}) error {
-	h.DLogf("AddShutdownChildChan()")
+	// h.DLogf("AddShutdownChildChan()")
 	h.Lock.Lock()
 	if h.state >= StateShutDown {
 		h.Lock.Unlock()
@@ -758,7 +762,7 @@ func (h *Helper) AddShutdownChildChan(childDoneChan <-chan struct{}) error {
 // code is ignored.
 // An error is returned if StateShutdown has already been reached.
 func (h *Helper) AddAsyncShutdownChild(child AsyncShutdowner) error {
-	h.DLogf("AddAsyncShutdownChild(\"%s\")", child)
+	// h.DLogf("AddAsyncShutdownChild(\"%s\")", child)
 	h.Lock.Lock()
 	if h.state >= StateShutDown {
 		h.Lock.Unlock()
@@ -770,15 +774,15 @@ func (h *Helper) AddAsyncShutdownChild(child AsyncShutdowner) error {
 		select {
 		case <-child.ShutdownDoneChan():
 			// The child was shut down by someone else before we got to StateLocalShutdown. No reason to keep waiting.
-			h.DLogf("Shutdown of child done before local shutdown complete, signalling wg: \"%s\"", child)
+			// h.DLogf("Shutdown of child done before local shutdown complete, signalling wg: \"%s\"", child)
 		case <-h.localShutdownDoneChan:
-			h.DLogf("Local shutdown done, shutting down async child \"%s\"", child)
+			// h.DLogf("Local shutdown done, shutting down async child \"%s\"", child)
 			child.StartShutdown(h.shutdownErr)
 			err := child.WaitShutdown()
 			if err == nil {
-				h.DLogf("Shutdown of child done, signalling wg: \"%s\"", child)
+				// h.DLogf("Shutdown of child done, signalling wg: \"%s\"", child)
 			} else {
-				h.DLogf("Shutdown of child done with error, signalling wg: \"%s\": %s", child, err)
+				// h.DLogf("Shutdown of child done with error, signalling wg: \"%s\": %s", child, err)
 			}
 		}
 		h.wg.Done()
@@ -792,7 +796,7 @@ func (h *Helper) AddAsyncShutdownChild(child AsyncShutdowner) error {
 // goroutine, in parallel with shutdown and closure of other dependent children.
 // An error is returned if StateShutdown has already been reached.
 func (h *Helper) AddSyncCloseChild(child io.Closer) error {
-	h.DLogf("AddSyncCloseChild(\"%s\")", child)
+	// h.DLogf("AddSyncCloseChild(\"%s\")", child)
 	h.Lock.Lock()
 	if h.state >= StateShutDown {
 		h.Lock.Unlock()

@@ -18,7 +18,9 @@ package asyncobj
 // Methods:
 //
 // StartShutdown schedules asynchronous shutdown of the object. If the object
-// has already been scheduled for shutdown, it has no effect.
+// has already been scheduled for shutdown, it has no effect. It returns
+// true if shutdown was actually started by this call, or false if shutdown
+// had already been started.
 // completionErr is an advisory error (or nil) to use as the completion status
 // from WaitShutdown(). The implementation may use this value or decide to return
 // something else.
@@ -28,16 +30,10 @@ package asyncobj
 // After this channel is closed, it is guaranteed that IsDoneShutdown() will
 // return true, and WaitForShutdown will not block.
 //
-// IsDoneShutdown returns false if the object and all dependents have not yet completely
-// shut down. Otherwise it returns true with the guarantee that
-// ShutDownDoneChan() will be immediately closed and WaitForShutdown
-// will immediately return the final status.
-//
 // WaitShutdown blocks until the object is completely shut down, and
 // returns the final completion status
 type AsyncShutdowner interface {
-	StartShutdown(completionErr error)
+	StartShutdown(completionErr error) bool
 	ShutdownDoneChan() <-chan struct{}
-	IsDoneShutdown() bool
 	WaitShutdown() error
 }
