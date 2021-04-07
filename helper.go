@@ -2,10 +2,12 @@ package asyncobj
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 
+	"github.com/sammck-go/logger"
 	llogger "github.com/sammck-go/logger"
 )
 
@@ -84,12 +86,177 @@ const (
 	StateShutDown State = iota
 )
 
+type AsyncHelper interface {
+	AsyncShutdowner
+	io.Closer
+
+	// Lck returns a general purpose mutex that may be used for fine-grained locking
+	Lck() *sync.Mutex
+
+	// Lg returns the logger attached to this AsyncHelper
+	Lg() logger.Logger
+
+	// SetLg sets the logger attached to this asynchelper
+	// It is unsafe to call this method while other goroutines may call be calling Lg(). For this reason
+	// it should be called before activation or background goroutines are started.
+	SetLg(lg logger.Logger)
+
+	// SetOnceShutdownHandler sets the callback that will be made for shutdown.
+	// Cannot be called after activation.
+	SetOnceShutdownHandler(callback OnceShutdownHandler) error
+
+	// GetAsyncObjState returns the current state in the lifecycle of the object.
+	GetAsyncObjState() State
+
+	// DeferShutdown increments the shutdown defer count, preventing shutdown from starting. Returns an error
+	// if shutdown has already started. Note that pausing does not prevent shutdown from being scheduled
+	// with StartShutDown(), it just prevents actual async shutdown from beginning. Similarly, a successful
+	// return from this call does not mean shutdown has not been scheduled--just that it has not started.
+	// Each successful call to DeferShutdown must pair with a matching call to UndeferShutdown.
+	// This mechanism allows objects to simplify synchronization in critical sections of code that do not
+	// want to deal with races between HandleOnceShutdown and their actions.
+	DeferShutdown() error
+
+	// UndeferShutdown decrements the shutdown defer count, and if it becomes zero, allows shutdown to start
+	// If a shutdown was scheduled and this method decrements the deferral count to 0, the helper
+	// will transition directly to StateShuttingDown before returning.
+	UndeferShutdown()
+
+	// IsActivated returns true if the object has ever been successfully activated. Once it becomes
+	// true, it is never reset, even after shutting down. If shutdown starts before it is set to true,
+	// it remains false permanently.
+	IsActivated() bool
+
+	// DoOnceActivate is called by the application at any point where activation of the object
+	// is required. Upon successful return, the object has been fully and successfully activated,
+	// though it may already be shutting down. Upon error return, the object is already scheduled
+	// for shutdown, and if waitOnFail is true, has been completely shutdown.
+	//
+	// This method ensures that activation occurs only once and takes steps to activate the object:
+	//
+	// If activation fails, the object will go directly into StateShuttingDown without passing through
+	// StateActivated.
+	//
+	// It is safe to call this method multiple times (normally with the same parameters). Only the
+	// first caller will perform activation, but all callers will complete when the first caller
+	// completes, and will complete with the same return code.
+	//
+	// Note that while onceActivateCallback is running, shutdown is deferred.  This prevents the
+	// object from being actively shut down while activation is in progress (though a shutdown
+	// can be scheduled). Because of this, onceActivateCallback *must not* wait for shutdown
+	// or call Close(), since a deadlock will result.
+	//
+	// If onceActivateCallback is nil, interface HandleOnceActivator on the object must be implemented and is used instead.
+	//
+	// The caller must not call this method with waitOnFail==true if shutdowns are deferred, unless
+	// these deferrals can be released before DoOnceActivate returns; otherwise a deadlock will occur.
+	DoOnceActivate(onceActivateCallback OnceActivateCallback, waitOnFail bool) error
+
+	// UndeferAndWaitShutdown decrements the shutdown defer count and waits for shutdown.
+	// Returns the final completion code. Does not actually initiate shutdown, so intended
+	// for cases when you wish to wait for the natural life of the object.
+	// The caller must not call this method if shutdowns are deferred, unless
+	// these deferrals can be released before this method returns; otherwise a deadlock will occur.
+	// This method is suitable for use in a golang defer statement after DeferShutdown.
+	UndeferAndWaitShutdown(completionErr error) error
+
+	// ShutdownOnContext begins background monitoring of a context.Context, and
+	// will begin asynchronously shutting down this helper with the context's error
+	// if the context is completed. This method does not block, it just
+	// constrains the lifetime of this object to a context. The background resources required to
+	// do this are freed when either the context is cancelled or shutdown is scheduled.
+	ShutdownOnContext(ctx context.Context)
+
+	// IsScheduledShutdown returns true if StartShutdown() has been called. It continues to return true after shutdown
+	// is started and completes
+	IsScheduledShutdown() bool
+
+	// IsStartedShutdown returns true if shutdown has begun, and shutdown can no longer be deferred.
+	// It continues to return true after shutdown is complete.
+	IsStartedShutdown() bool
+
+	// IsDoneLocalShutdown returns true if local shutdown is complete, not including cleanup of
+	// background tasks and shutdown of dependents. If
+	// true, final completion status is available. Continues to return true after final shutdown.
+	IsDoneLocalShutdown() bool
+
+	// IsDoneShutdown returns true if shutdown is complete, including shutdown of dependents. Final completion
+	// status is available.
+	IsDoneShutdown() bool
+
+	// ShutdownWGAdd adds a delta to a sync.Waitgroup to
+	// defer final completion of shutdown until the specified number of calls to
+	// Done() are made. Note that this waitgroup does not prevent local shutdown from happening;
+	// it just holds off code that is waiting for final shutdown to complete. This helps with clean and complete
+	// shutdown of background tasks and dependent objects before process exit.
+	// On success, a reference to the waitgroup is returned on which you can directly call Done().
+	// An error is returned and no action is taken if delta is <= 0, or after StateShutdown has been entered.
+	ShutdownWGAdd(delta int) (*sync.WaitGroup, error)
+
+	// ShutdownStartedChan returns a channel that will be closed as soon as StateShuttingDown is entered and
+	// shutdown can no longer be deferred. Anyone
+	// can use this channel to be notified when the object has begun shutting down.
+	ShutdownStartedChan() <-chan struct{}
+
+	// LocalShutdownDoneChan returns a channel that will be closed when StateLocalShutdown
+	// is reached, after shutdownHandler, but before background tasks and dependents are waited for. At this time,
+	// the final completion status is available. Anyone can use this channel to be notified when
+	// local shutdown is done and the final completion status is available.
+	LocalShutdownDoneChan() <-chan struct{}
+
+	// WaitLocalShutdown waits for the local shutdown to complete, without waiting for dependents
+	// and background tasks to finish shutting down, and returns the final completion status.
+	// It does not initiate shutdown, so it can be used to wait on an object that
+	// will shutdown at an unspecified point in the future.
+	// The caller must not call this method if shutdowns are deferred, unless
+	// these deferrals can be released before this method returns; otherwise a deadlock will occur.
+	WaitLocalShutdown() error
+
+	// Shutdown performs a synchronous local shutdown, but does not wait for background tasks and dependents to
+	// fully shut down. It initiates shutdown if it has not already started, waits for local
+	// shutdown to comlete, then returns the final shutdown status.
+	// The caller must not call this method if shutdowns are deferred, unless
+	// these deferrals can be released before this method returns; otherwise a deadlock will occur.
+	LocalShutdown(completionError error) error
+
+	// Shutdown performs a synchronous shutdown. It initiates shutdown if it has
+	// not already started, waits for the shutdown to comlete (including shutdown of background
+	// tasks and dependencies), then returns
+	// the final shutdown status.
+	// The caller must not call this method if shutdowns are deferred, unless
+	// these deferrals can be released before this method returns; otherwise a deadlock will occur.
+	Shutdown(completionError error) error
+
+	// AddShutdownChildChan adds a chan that will be waited on after StateLocalShutdown,
+	// before this object's shutdown is considered complete. The caller should close the
+	// chan when conditions have been met to allow shutdown to complete. The Helper will not take
+	// any action to cause the chan to be closed; it is the caller's responsibility to do that.
+	// An error is returned if StateShutdown has already been reached.
+	AddShutdownChildChan(childDoneChan <-chan struct{}) error
+
+	// AddAsyncShutdownChild adds a dependent child object that implements AsyncShutdowner to
+	// the set of objects that will be actively shut down by this helper after StateLocalShutdown, before this
+	// object's shutdown is considered complete. The child will be shut down in parallel with shutdown of other
+	// children, with an advisory completion status equal to the status returned from HandleOnceShutdown.
+	// The childs final completion code is ignored.
+	// An error is returned if StateShutdown has already been reached.
+	AddAsyncShutdownChild(child AsyncShutdowner) error
+
+	// AddSyncCloseChild adds a dependent child object that implements io.Closer to the set of objects
+	// that will be actively closed by this helper after StateLocalShutdown, before this
+	// object's shutdown is considered complete. The child will be Close()'d in its own
+	// goroutine, in parallel with shutdown and closure of other dependent children. The return code
+	// of the child's Close() method is ignored.
+	// An error is returned if StateShutdown has already been reached.
+	AddSyncCloseChild(child io.Closer) error
+}
+
 // Helper is a a state machine that manages clean asynchronous object activation and shutdown.
 // Typically it is included as an anonymous base member of the object being managed, but it
 // can also work as an independent managing object.
 type Helper struct {
 	// Logger is the Logger that will be used for log output from this helper
-	Logger
+	lg Logger
 
 	// o is the object being managed
 	obj interface{}
@@ -156,6 +323,7 @@ type Helper struct {
 	wg sync.WaitGroup
 }
 
+/*
 // InitHelperWithShutdownHandler initializes a new Helper in place with an optional independent
 // shutdown handler function. Useful for embedding in an object, when it must be initialized after
 // the obj pointer is available.
@@ -173,7 +341,7 @@ func (h *Helper) InitHelperWithShutdownHandler(
 	if logger == nil {
 		logger = llogger.NilLogger
 	}
-	h.Logger = logger
+	h.lg = logger
 	h.obj = obj
 	h.state = StateUnactivated
 	h.shutdownHandler = shutdownHandler
@@ -190,6 +358,7 @@ func (h *Helper) InitHelper(
 ) {
 	h.InitHelperWithShutdownHandler(obj, logger, nil)
 }
+*/
 
 // NewHelperWithShutdownHandler creates a new Helper as its own object with an independent
 // shutdown handler function.
@@ -197,9 +366,9 @@ func (h *Helper) InitHelper(
 // If shutDownHandler is nil, then obj must implement HandleOnceShutdowner
 func NewHelperWithShutdownHandler(
 	obj interface{},
-	logger Logger,
+	logger logger.Logger,
 	shutdownHandler OnceShutdownHandler,
-) *Helper {
+) AsyncHelper {
 	if shutdownHandler == nil {
 		// panic early if required interface not implemented
 		_ = obj.(HandleOnceShutdowner)
@@ -208,7 +377,7 @@ func NewHelperWithShutdownHandler(
 		logger = llogger.NilLogger
 	}
 	h := &Helper{
-		Logger:                logger,
+		lg:                    logger,
 		obj:                   obj,
 		state:                 StateUnactivated,
 		shutdownHandler:       shutdownHandler,
@@ -224,9 +393,33 @@ func NewHelperWithShutdownHandler(
 func NewHelper(
 	logger Logger,
 	obj HandleOnceShutdowner,
-) *Helper {
+) AsyncHelper {
 	h := NewHelperWithShutdownHandler(obj, logger, nil)
 	return h
+}
+
+func (h *Helper) Lck() *sync.Mutex {
+	return &h.Lock
+}
+
+func (h *Helper) Lg() logger.Logger {
+	return h.lg
+}
+
+func (h *Helper) SetLg(lg logger.Logger) {
+	h.lg = lg
+}
+
+// SetOnceShutdownHandler sets the callback that will be made for shutdown.
+// Cannot be called after activation.
+func (h *Helper) SetOnceShutdownHandler(callback OnceShutdownHandler) error {
+	h.Lock.Lock()
+	defer h.Lock.Unlock()
+	if h.state >= StateActivated {
+		return errors.New("Cannot SetOnceShutdownHandler after activation")
+	}
+	h.shutdownHandler = callback
+	return nil
 }
 
 // GetAsyncObjState returns the current state in the lifecycle of the object.
@@ -244,7 +437,7 @@ func (h *Helper) DeferShutdown() error {
 	h.Lock.Lock()
 	defer h.Lock.Unlock()
 	if h.state >= StateShuttingDown {
-		return h.Errorf("Shutdown already started; cannot defer")
+		return errors.New("Shutdown already started; cannot defer")
 	}
 	h.shutdownDeferCount++
 	return nil
@@ -272,7 +465,7 @@ func (h *Helper) SetIsActivated() error {
 
 	if !h.isActivated {
 		if h.state >= StateShuttingDown {
-			return h.Errorf("Cannot activate; shutdown already initiated")
+			return errors.New("Cannot activate; shutdown already initiated")
 		}
 		h.isActivated = true
 		h.state = StateActivated
@@ -355,7 +548,7 @@ func (h *Helper) DoOnceActivate(onceActivateCallback OnceActivateCallback, waitO
 			err = h.WaitShutdown()
 		}
 		if err == nil {
-			err = h.Errorf("Shutdown of object already started; cannot SetIsActivated")
+			err = errors.New("Shutdown of object already started; cannot SetIsActivated")
 		}
 		return err
 	}
@@ -408,7 +601,7 @@ func (h *Helper) lockedEnterShuttingDownState() {
 func (h *Helper) UndeferShutdown() {
 	h.Lock.Lock()
 	if h.shutdownDeferCount < 1 {
-		h.Panic("UndeferShutdown before DeferShutdown")
+		h.lg.Panic("UndeferShutdown before DeferShutdown")
 		return
 	}
 	h.shutdownDeferCount--
@@ -573,16 +766,24 @@ func (h *Helper) IsDoneShutdown() bool {
 	return h.state >= StateShutDown
 }
 
-// GetShutdownWG returns a sync.WaitGroup that you can call Add() on to
+// ShutdownWGAdd adds a delta to a sync.Waitgroup to
 // defer final completion of shutdown until the specified number of calls to
-// ShutdownWG().Done() are made. Note that this waitgroup does not prevent shutdown from happening;
+// Done() are made. Note that this waitgroup does not prevent shutdown from happening;
 // it just holds off code that is waiting for shutdown to complete. This helps with clean and complete
 // shutdown before process exit.
-// The caller is responsible for not adding to the WaitGroup after StateShutdown has been entered.
-// This method rarely needs to be called directly by applications; most of the time AddShutdownChildChan
-// is a better choice, as it enforces the StateShutdown exclusion.
-func (h *Helper) GetShutdownWG() *sync.WaitGroup {
-	return &h.wg
+// On success, a reference to the waitgroup is returned on which you can directly call Done().
+// An error is returned and no action is taken if delta is <= 0, or after StateShutdown has been entered.
+func (h *Helper) ShutdownWGAdd(delta int) (*sync.WaitGroup, error) {
+	if delta <= 0 {
+		return nil, errors.New("ShutdownWGAdd: delta must be > 0")
+	}
+	h.Lock.Lock()
+	defer h.Lock.Unlock()
+	if h.state >= StateShutDown {
+		return nil, errors.New("Cannot add to ShutdownWG after StateShutdown")
+	}
+	h.wg.Add(delta)
+	return &h.wg, nil
 }
 
 // ShutdownStartedChan returns a channel that will be closed as soon as shutdown is initiated. Anyone
@@ -705,7 +906,7 @@ func (h *Helper) StartShutdown(completionErr error) bool {
 	isFirst := !h.isScheduledShutdown
 	if isFirst {
 		if h.state >= StateShuttingDown {
-			h.Panic("shutdown started before scheduled")
+			h.lg.Panic("shutdown started before scheduled")
 		}
 		h.shutdownErr = completionErr
 		h.isScheduledShutdown = true
@@ -806,12 +1007,12 @@ func (h *Helper) AddSyncCloseChild(child io.Closer) error {
 	h.Lock.Unlock()
 	go func() {
 		<-h.localShutdownDoneChan
-		h.DLogf("Local shutdown done, shutting down sync Closer child \"%s\"", child)
+		h.lg.TLogf("Local shutdown done, shutting down sync Closer child \"%s\"", child)
 		err := child.Close()
 		if err == nil {
-			h.DLogf("Close of child done, signalling wg: \"%s\"", child)
+			h.lg.TLogf("Close of child done, signalling wg: \"%s\"", child)
 		} else {
-			h.DLogf("Close of child done with error, signalling wg: \"%s\": %s", child, err)
+			h.lg.TLogf("Close of child done with error, signalling wg: \"%s\": %s", child, err)
 		}
 		h.wg.Done()
 	}()
